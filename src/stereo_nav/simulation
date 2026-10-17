@@ -1,0 +1,201 @@
+"""PyBullet world and wheel-actuated TurtleBot-style research platform.
+
+The robot is an original simplified model, not an official TurtleBot URDF.
+Only RGB, wheel encoders and noisy gyro rates cross into the navigation stack.
+"""
+from pathlib import Path
+import math
+import numpy as np
+import pybullet as pb
+from .config import CAMERA, ROBOT, GRID, ODOMETRY
+from .geometry import integrate, wheel_rates
+
+
+def robot_urdf():
+    links = '''<link name="base">
+      <inertial><mass value="3.0"/><inertia ixx="0.04" iyy="0.04" izz="0.06" ixy="0" ixz="0" iyz="0"/></inertial>
+      <visual><geometry><cylinder radius="0.17" length="0.08"/></geometry><material name="body"><color rgba="0.10 0.18 0.24 1"/></material></visual>
+      <collision><geometry><cylinder radius="0.17" length="0.08"/></geometry></collision></link>'''
+    for name, y in [('left', ROBOT.track / 2), ('right', -ROBOT.track / 2)]:
+        links += f'''<link name="{name}_wheel">
+        <inertial><mass value="0.15"/><inertia ixx="0.0003" iyy="0.0005" izz="0.0003" ixy="0" ixz="0" iyz="0"/></inertial>
+        <visual><origin rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.08" length="0.035"/></geometry><material name="rubber"><color rgba="0.03 0.03 0.03 1"/></material></visual>
+        <collision><origin rpy="1.57079632679 0 0"/><geometry><cylinder radius="0.08" length="0.035"/></geometry></collision></link>
+        <joint name="{name}_drive" type="continuous"><parent link="base"/><child link="{name}_wheel"/><origin xyz="0 {y} -0.05"/><axis xyz="0 1 0"/><dynamics damping="0.001" friction="0"/></joint>'''
+    for name, x in [('front', .12), ('rear', -.12)]:
+        links += f'''<link name="{name}_caster"><inertial><mass value="0.01"/><inertia ixx="0.00001" iyy="0.00001" izz="0.00001" ixy="0" ixz="0" iyz="0"/></inertial>
+        <visual><geometry><sphere radius="0.035"/></geometry></visual><collision><geometry><sphere radius="0.035"/></geometry></collision></link>
+        <joint name="{name}_fixed" type="fixed"><parent link="base"/><child link="{name}_caster"/><origin xyz="{x} 0 -0.095"/></joint>'''
+    links += '''<link name="stereo_rig"><inertial><mass value="0.08"/><inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/></inertial>
+    <visual><geometry><box size="0.04 0.22 0.04"/></geometry><material name="camera"><color rgba="0.1 0.7 0.65 1"/></material></visual>
+    <visual><origin xyz="0 0 -0.16"/><geometry><cylinder radius="0.012" length="0.28"/></geometry><material name="body"/></visual>
+    <visual><origin xyz="0.025 0.09 0"/><geometry><sphere radius="0.024"/></geometry><material name="rubber"/></visual>
+    <visual><origin xyz="0.025 -0.09 0"/><geometry><sphere radius="0.024"/></geometry><material name="rubber"/></visual></link>
+    <joint name="camera_mount" type="fixed"><parent link="base"/><child link="stereo_rig"/><origin xyz="0.10 0 0.31"/></joint>'''
+    return '<?xml version="1.0"?><robot name="stereo_turtle">' + links + '</robot>'
+
+
+class Simulation:
+    scene_style = 'solid-colors-v1'
+
+    def __init__(self, output, seed=7, scenario='slalom', gui=False, use_imu=True):
+        self.client = pb.connect(pb.GUI if gui else pb.DIRECT)
+        self.output = Path(output)
+        self.output.mkdir(parents=True, exist_ok=True)
+        self.rng = np.random.default_rng(seed)
+        self.imu_rng = np.random.default_rng(seed + 10000)
+        self.use_imu = use_imu
+        self.scenario, self.time = scenario, 0.0
+        self.start = np.array([1.5, 5.0, 0.0])
+        self.goal = np.array([12.0, 5.0])
+        self.obstacles = []
+        self.boxes = []
+        self.collided = False
+        self.closest = float('inf')
+        self.depth_truth = None
+        self.object_mask = None
+        self.truth_path = [self.start[:2].copy()]
+        pb.setGravity(0, 0, -9.81)
+        pb.setTimeStep(1 / 120)
+        pb.setPhysicsEngineParameter(numSolverIterations=80, deterministicOverlappingPairs=1)
+        self.obstacle_palette = [
+            (.88, .16, .12, 1),  # red
+            (.12, .38, .86, 1),  # blue
+            (.98, .62, .08, 1),  # amber
+            (.16, .66, .30, 1),  # green
+            (.58, .24, .76, 1),  # purple
+        ]
+        self.colored_obstacles = 0
+        # Plain materials in both the GUI and stereo images: no image textures.
+        self.floor = self._box((7, 5, -.08), (7, 5, .08), obstacle=False,
+                               color=(.60, .60, .60, 1))
+        for center, half in [((7, -.15, .6), (7, .15, .6)), ((7, 10.15, .6), (7, .15, .6)),
+                             ((-.15, 5, .6), (.15, 5, .6)), ((14.15, 5, .6), (.15, 5, .6))]:
+            self._box(center, half, color=(.30, .33, .37, 1))
+        layouts = {
+            'slalom': [(5, 5, .65, 1.1), (8, 3.9, .65, 1.2), (10, 6.2, .6, 1.0)],
+            'corridor': [(6.8, 2.7, 4.2, .35), (6.8, 7.3, 4.2, .35), (7, 4.6, .5, .55)],
+            'blocked': [(5.5, 4.7, .45, 2.0), (8.5, 7.5, .45, 1.6)],
+            'empty': [],
+            'reveal': [(5, 5.7, .6, .8)],
+        }
+        if scenario not in layouts:
+            raise ValueError(f'Unknown scenario: {scenario}')
+        for x, y, hx, hy in layouts[scenario]:
+            # Small perturbations make repeat-seed evaluation meaningful.
+            dy = self.rng.uniform(-.12, .12)
+            self._box((x, y + dy, .5), (hx, hy, .5))
+        robot_file = self.output / 'robot.urdf'
+        robot_file.write_text(robot_urdf(), encoding='utf-8')
+        self.robot = pb.loadURDF(str(robot_file), [*self.start[:2], .13])
+        for joint in range(pb.getNumJoints(self.robot)):
+            pb.changeDynamics(self.robot, joint, lateralFriction=1.0 if joint < 2 else 0.001,
+                              rollingFriction=0.001, spinningFriction=0.001)
+        for _ in range(120):
+            pb.stepSimulation()
+        # Stationary gyro bias calibration. Angular rate is an inertial sensor
+        # measurement, never absolute simulator heading or position.
+        self.gyro_bias_estimate = float(np.mean([
+            self._gyro_rate() for _ in range(240)]))
+        self.encoders = self._encoders()
+        self.odometry = self.start.copy()
+        self.distance = 0.0
+        self.projection = pb.computeProjectionMatrixFOV(CAMERA.vertical_fov, CAMERA.width / CAMERA.height, .05, 30)
+        if gui:
+            pb.resetDebugVisualizerCamera(12, 0, -75, [7, 5, 0])
+
+    def _box(self, center, half, obstacle=True, color=None):
+        if color is None:
+            color = self.obstacle_palette[self.colored_obstacles % len(self.obstacle_palette)]
+            self.colored_obstacles += 1
+        collision = pb.createCollisionShape(pb.GEOM_BOX, halfExtents=half)
+        visual = pb.createVisualShape(pb.GEOM_BOX, halfExtents=half, rgbaColor=color)
+        body = pb.createMultiBody(0, collision, visual, center)
+        if obstacle:
+            self.obstacles.append(body)
+            self.boxes.append((np.array(center[:2]), np.array(half[:2])))
+        return body
+
+    def _encoders(self):
+        return np.array([pb.getJointState(self.robot, i)[0] for i in (0, 1)])
+
+    def _gyro_rate(self):
+        angular_rate = pb.getBaseVelocity(self.robot)[1][2]
+        return angular_rate + ODOMETRY.gyro_bias + self.imu_rng.normal(0, ODOMETRY.gyro_noise_std)
+
+    def step(self, v, w, duration=.2):
+        rates = wheel_rates(v, w, ROBOT.wheel_radius, ROBOT.track)
+        for joint, rate in enumerate(rates):
+            pb.setJointMotorControl2(self.robot, joint, pb.VELOCITY_CONTROL, targetVelocity=rate, force=2.0)
+        gyro_delta = 0.
+        for _ in range(round(duration * 120)):
+            pb.stepSimulation()
+            gyro_delta += (self._gyro_rate() - self.gyro_bias_estimate) / 120
+            for contact in pb.getContactPoints(bodyA=self.robot):
+                if contact[2] in self.obstacles:
+                    self.collided = True
+        enc = self._encoders()
+        travel = (enc - self.encoders) * ODOMETRY.wheel_radius
+        encoder_yaw = (travel[1] - travel[0]) / ODOMETRY.effective_track
+        weight = ODOMETRY.gyro_weight if self.use_imu else 0.
+        heading_delta = weight * gyro_delta + (1 - weight) * encoder_yaw
+        self.odometry = integrate(self.odometry, float(travel.mean()), float(heading_delta), 1.)
+        self.encoders = enc
+        self.time += duration
+        xy = self.true_pose()[:2]
+        self.distance += np.linalg.norm(xy - self.truth_path[-1])
+        self.truth_path.append(xy)
+        for center, half in self.boxes:
+            gap = np.maximum(np.abs(xy - center) - half, 0)
+            self.closest = min(self.closest, np.linalg.norm(gap) - ROBOT.footprint_radius)
+        if self.scenario == 'reveal' and self.time >= 8 and not getattr(self, 'revealed', False):
+            self._box((7, 4.6, .5), (.5, 1.3, .5))
+            self.revealed = True
+        return self.odometry.copy()
+
+    def true_pose(self):
+        pos, orn = pb.getBasePositionAndOrientation(self.robot)
+        return np.array([pos[0], pos[1], pb.getEulerFromQuaternion(orn)[2]])
+
+    def capture_rgb(self):
+        pose = self.true_pose()
+        c, s = math.cos(pose[2]), math.sin(pose[2])
+        forward, left = np.array([c, s, 0]), np.array([-s, c, 0])
+        center = np.array([pose[0], pose[1], CAMERA.height_m]) + CAMERA.forward_m * forward
+        images = []
+        for sign in (1, -1):
+            eye = center + sign * CAMERA.baseline / 2 * left
+            view = pb.computeViewMatrix(eye, eye + forward, [0, 0, 1])
+            _, _, rgba, depth, segmentation = pb.getCameraImage(
+                CAMERA.width, CAMERA.height, view, self.projection, renderer=pb.ER_TINY_RENDERER,
+                flags=pb.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX)
+            images.append(np.asarray(rgba, np.uint8).reshape(CAMERA.height, CAMERA.width, 4)[:, :, :3].copy())
+            if sign == 1:
+                # Retained inside simulator for EVALUATION only; never returned
+                # by the RGB sensor API or passed to the mapper/controller.
+                z = np.asarray(depth).reshape(CAMERA.height, CAMERA.width)
+                self.depth_truth = 30 * .05 / (30 - (30 - .05) * z)
+                seg = np.asarray(segmentation).reshape(CAMERA.height, CAMERA.width)
+                self.object_mask = np.isin(seg & ((1 << 24) - 1), self.obstacles)
+        return tuple(images)
+
+    def evaluate_depth(self, observation):
+        roi = self.object_mask & (self.depth_truth >= CAMERA.min_depth) & (self.depth_truth <= CAMERA.max_depth)
+        mask = roi & observation.valid
+        return {'depth_count': int(mask.sum()), 'depth_roi_count': int(roi.sum()),
+                'depth_abs_sum': float(np.abs(observation.depth[mask] - self.depth_truth[mask]).sum()),
+                'depth_squared_sum': float(np.square(observation.depth[mask] - self.depth_truth[mask]).sum())}
+
+    def overview_rgb(self):
+        """Third-person instrumentation only; never used by navigation."""
+        pose = self.true_pose()
+        forward = np.array([math.cos(pose[2]), math.sin(pose[2]), 0])
+        center = np.array([*pose[:2], .25])
+        eye = center - 2.2 * forward + np.array([0, 0, 1.9])
+        view = pb.computeViewMatrix(eye, center + .7 * forward, [0, 0, 1])
+        projection = pb.computeProjectionMatrixFOV(60, 435 / 245, .05, 30)
+        result = pb.getCameraImage(435, 245, view, projection, renderer=pb.ER_TINY_RENDERER)
+        return np.asarray(result[2], np.uint8).reshape(245, 435, 4)[:, :, :3].copy()
+
+    def close(self):
+        pb.disconnect(self.client)
