@@ -1,7 +1,8 @@
 # Navigation-with-Stereo-Vision
 Implemented with a wheeled robot with stereo obstacle detection, occupancy mapping, A* replanning, and wheel/gyro odometry.
 
-<img width="1920" height="1692" alt="photo_2026-10-18_01-14-52" src="https://github.com/user-attachments/assets/9c0ce71a-2b66-4552-8d11-b5d267655152" />
+<img width="1336" height="1177" alt="image" src="https://github.com/user-attachments/assets/00853eeb-dbf3-4c50-88fe-e574ba64a14e" />
+
 
 
 ## Simulation Environment
