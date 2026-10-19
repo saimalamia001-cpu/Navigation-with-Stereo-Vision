@@ -11,12 +11,10 @@ Pybullet simulation environment was used to test the model.
 ### Stereo navigation dashboard
 <img width="1280" height="1000" alt="obstacle-view" src="https://github.com/user-attachments/assets/9e55c819-9c5e-4af3-ae90-b2cab1f41a23" />
 
-## Trial videos
+## Path Search
 
-### Path search 
-https://github.com/user-attachments/assets/fb6abbe8-7113-4c09-b526-15489a2e847b
+https://github.com/user-attachments/assets/98da2c05-a765-403a-88a9-26e1c00abae0
 
-The robot reached the goal in 53.6 simulated seconds.
 ## Hardware
 
 | Component | Quantity | Purpose |
